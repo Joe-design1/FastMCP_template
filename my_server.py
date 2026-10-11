@@ -19,7 +19,12 @@ from pydantic import Field
 
 FASHN_BASE = "https://api.fashn.ai/v1"
 API_KEY = os.environ.get("FASHN_API_KEY", "")
-MCP_PATH = os.environ.get("MCP_PATH", "/mcp")
+MCP_PATH = os.environ.get("MCP_PATH", "").strip()
+if not MCP_PATH.startswith("/mcp-") or len(MCP_PATH) < 5 + 24:
+    raise SystemExit(
+        "Refusing to start: set MCP_PATH to a secret path like /mcp-<32 random characters>. "
+        "The default /mcp would expose the store and FASHN credits to anyone."
+    )
 PENDING = {"starting", "in_queue", "processing"}
 
 mcp = FastMCP(
