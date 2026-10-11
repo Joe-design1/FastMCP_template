@@ -1,4 +1,4 @@
-"""FASHN AI MCP server for Diriava.
+"""FASHN AI + Shopify Admin MCP server for Diriava.
 
 Exposes the FASHN API (https://docs.fashn.ai) as MCP tools so Claude can
 generate on-model product images without ever seeing the API key.
@@ -23,13 +23,15 @@ MCP_PATH = os.environ.get("MCP_PATH", "/mcp")
 PENDING = {"starting", "in_queue", "processing"}
 
 mcp = FastMCP(
-    name="fashn",
+    name="diriava",
     instructions=(
         "Tools for the FASHN AI image API. Use product_to_model to turn a product "
         "photo (flat-lay or ghost mannequin) into an on-model photo, try_on to dress "
         "an existing model photo in a garment, and get_status to fetch results of a "
         "job that is still running. Output URLs stay valid for about 3 days: import "
-        "them into Shopify straight away. Each output image costs FASHN credits."
+        "them into Shopify straight away. Each output image costs FASHN credits. "
+        "shopify_graphql runs any Shopify Admin GraphQL query or mutation on the "
+        "Diriava store; shopify_granted_scopes lists what the app is allowed to do."
     ),
 )
 
@@ -151,6 +153,76 @@ async def get_status(
     data = await _status(prediction_id)
     return {"id": prediction_id, "status": data.get("status"),
             "output": data.get("output") or [], "error": data.get("error")}
+
+
+# ---------------------------------------------------------------------------
+# Shopify Admin GraphQL (Dev Dashboard app, client credentials grant)
+#   SHOPIFY_SHOP            e.g. t23ayj-0p.myshopify.com
+#   SHOPIFY_CLIENT_ID       from Dev Dashboard > App settings
+#   SHOPIFY_CLIENT_SECRET   from Dev Dashboard > App settings
+#   SHOPIFY_API_VERSION     optional, default 2026-07
+# Tokens last 24 h; they are fetched and refreshed automatically.
+# ---------------------------------------------------------------------------
+import time
+
+SHOP = os.environ.get("SHOPIFY_SHOP", "")
+SHOP_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "")
+SHOP_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
+SHOP_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2026-07")
+_shop_token = {"value": None, "expires_at": 0.0}
+_shop_lock = asyncio.Lock()
+
+
+async def _shopify_token() -> str:
+    if not (SHOP and SHOP_CLIENT_ID and SHOP_CLIENT_SECRET):
+        raise RuntimeError("SHOPIFY_SHOP, SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET must be set on the server.")
+    async with _shop_lock:
+        if _shop_token["value"] and time.time() < _shop_token["expires_at"] - 300:
+            return _shop_token["value"]
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                f"https://{SHOP}/admin/oauth/access_token",
+                data={"grant_type": "client_credentials",
+                      "client_id": SHOP_CLIENT_ID, "client_secret": SHOP_CLIENT_SECRET},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        if r.status_code >= 400:
+            raise RuntimeError(f"Shopify token error {r.status_code}: {r.text[:300]}")
+        data = r.json()
+        _shop_token["value"] = data["access_token"]
+        _shop_token["expires_at"] = time.time() + int(data.get("expires_in", 86399))
+        return _shop_token["value"]
+
+
+async def _shopify_gql(query: str, variables: Optional[dict] = None) -> dict:
+    token = await _shopify_token()
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(
+            f"https://{SHOP}/admin/api/{SHOP_API_VERSION}/graphql.json",
+            json={"query": query, "variables": variables or {}},
+            headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
+        )
+    if r.status_code == 401:
+        _shop_token["value"] = None
+    if r.status_code >= 400:
+        raise RuntimeError(f"Shopify GraphQL error {r.status_code}: {r.text[:1000]}")
+    return r.json()
+
+
+@mcp.tool
+async def shopify_graphql(
+    query: Annotated[str, Field(description="A GraphQL Admin API query or mutation.")],
+    variables: Annotated[Optional[dict], Field(description="GraphQL variables.")] = None,
+) -> dict:
+    """Run any Shopify Admin GraphQL query or mutation on the Diriava store (full app scopes).
+    Returns the raw response including 'errors', 'userErrors' and cost 'extensions'."""
+    return await _shopify_gql(query, variables)
+
+
+@mcp.tool
+async def shopify_granted_scopes() -> dict:
+    """List the access scopes the Shopify app actually has on the store."""
+    return await _shopify_gql("{ currentAppInstallation { accessScopes { handle } } }")
 
 
 if __name__ == "__main__":
